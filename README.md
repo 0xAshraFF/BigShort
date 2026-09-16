@@ -1,0 +1,2 @@
+# BigShort
+binance short agent
