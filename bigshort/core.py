@@ -56,9 +56,11 @@ def upper(bars):
     return mean(values) + 2 * pstdev(values)
 
 
-def signal(h4, m15, m1, mode="both"):
+def signal(h4, m15, m1, mode="both", diagnostics=None):
     """Only closed candles. Return (setup, structural stop), or None."""
     if min(len(h4), len(m15), len(m1)) < 21:
+        if diagnostics is not None:
+            diagnostics.update(reason="insufficient_candles")
         return None
     a, b, c = h4[-1], m15[-1], m1[-1]
     # Upper-band touch alone does not establish a reversal.
@@ -72,6 +74,16 @@ def signal(h4, m15, m1, mode="both"):
     setup = "rejection" if rejection and mode != "momentum" else (
         "momentum" if momentum and mode != "rejection" else None)
     stop = max(b.h, max(x.h for x in m1[-3:])) * 1.001
+    if diagnostics is not None:
+        distance = stop / c.c - 1
+        reason = ("no_4h_extension" if not extended else
+                  "no_1m_breakdown" if not c.c < m1[-2].l else
+                  "no_enabled_15m_setup" if not setup else
+                  "stop_distance_out_of_range" if not .003 <= distance <= .05 else "signal")
+        diagnostics.update(reason=reason, mode=mode, extended_4h=extended,
+                           band_touch_15m=b.h >= upper(m15[:-1]), weak_candle_15m=weak,
+                           breakdown_1m=c.c < m1[-2].l, rejection=bool(rejection),
+                           momentum=bool(momentum), stop_distance_pct=round(distance*100,4))
     # Do not chase a candle after an excessively large displacement.
     return (setup, stop) if setup and .003 <= stop / c.c - 1 <= .05 else None
 

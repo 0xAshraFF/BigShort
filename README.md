@@ -71,6 +71,22 @@ Profit ladder uses **net P&L / initial allocated margin**: 5% ROE targets net br
 
 Fees and funding are included. Funding events are persisted and deduplicated. Actual liquidation, maintenance tiers, mark-price triggers and exchange-hosted orders are **not modeled**. Paper results can differ substantially from live execution.
 
+## Scan diagnostics
+
+Every cycle emits timestamped JSON logs: `scan_started`, one `symbol_scan` per evaluated symbol, and `scan_summary`. Match them by `scan_id`. The summary contains duration, exchange time, filter counts, scanned symbols, signals, entries and rejection totals. `empty_universe` means no contracts survived the filters; `completed` with zero signals means eligible symbols were evaluated without an entry setup. Errors explicitly use status `error`; existing exposure, a risk halt and the kill switch have separate statuses.
+
+Filter counters are sequential and mutually exclusive: unsupported/inactive contract, age, then volume. Their sum plus eligible equals total exchange symbols. Symbol logs include candle counts, last-close timestamps, age and freshness for each validated timeframe, plus strategy checks. Rejection reasons identify missing 4h extension, 1m breakdown, enabled 15m setup, out-of-range stops, invalid data or quote rejection. A signal refused by execution is labeled `entry_rejected_by_risk_cooldown_or_size`; this does not claim which execution guard fired.
+
+Diagnostics go to Docker logs, not SQLite trade events, to avoid growing the account journal on every scan. Existing state/config remain compatible and unchanged. Docker's configured log rotation applies. No signals, filters, position sizing or risk thresholds were loosened.
+
+```bash
+git pull --ff-only origin codex/paper-trading-agent
+docker compose up -d --build paper
+docker compose logs -f --tail 100 paper
+```
+
+Run from the existing checkout on `codex/paper-trading-agent`. Rebuilding preserves the existing named data volume; do not use `down -v`.
+
 ## Research
 
 ```bash

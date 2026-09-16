@@ -2,6 +2,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 from .core import Engine, signal
 
 log = logging.getLogger(__name__)
@@ -35,10 +36,31 @@ def manage(api, engine, store, now):
             break
 
 
+def emit(kind, **values):
+    print(json.dumps({"kind":kind,"timestamp":datetime.now(timezone.utc).isoformat(),**values}),flush=True)
+
+
 def cycle(api, engine, store, kill_file):
+    started = time.monotonic()
+    stats = {"scan_id":time.time_ns(),"status":"started","scanned":0,"signals":0,
+             "entries":0,"reasons":{}}
+    emit("scan_started",scan_id=stats["scan_id"])
+    try:
+        _cycle(api, engine, store, kill_file, stats)
+    except Exception as exc:
+        stats.update(status="error",error=str(exc))
+        raise
+    finally:
+        stats["duration_seconds"] = round(time.monotonic()-started,3)
+        emit("scan_summary",**stats)
+
+
+def _cycle(api, engine, store, kill_file, stats):
     now = api.now()
+    stats["exchange_time_ms"] = now
     manage(api, engine, store, now)
     if Path(kill_file).exists():
+        stats["status"] = "kill_switch"
         engine.halted = True
         if engine.position:
             # Emergency close uses current executable ask; no fresh-entry spread constraint.
@@ -49,27 +71,51 @@ def cycle(api, engine, store, kill_file):
         store.save(engine)
         return
     if engine.position or engine.halted:
+        stats["status"] = "position_open" if engine.position else "risk_halted"
         return
-    for item in api.universe(engine.cfg, now):
+    universe = api.universe(engine.cfg, now)
+    stats["universe"] = dict(getattr(api,"universe_stats",{"eligible":len(universe)}))
+    stats["status"] = "completed" if universe else "empty_universe"
+    for item in universe:
         symbol = item["symbol"]
+        stats["scanned"] += 1
+        detail = {"scan_id":stats["scan_id"],"symbol":symbol,"candles":{}}
         try:
             # Resync now for each symbol; do not enter on a scan that took minutes.
             current = api.now()
             frames = [api.bars(symbol, interval, current) for interval in ["4h", "15m", "1m"]]
-            for bars, interval in zip(frames, [14_400_000, 900_000, 60_000]):
-                if len(bars) < 21 or not 0 <= current - bars[-1].t < interval + 5_000:
-                    raise ValueError("Insufficient or stale candles")
+            for name, bars, interval in zip(["4h","15m","1m"],frames, [14_400_000, 900_000, 60_000]):
+                age = current-bars[-1].t if bars else None
+                detail["candles"][name] = {"count":len(bars),"last_close_ms":bars[-1].t if bars else None,
+                                          "age_ms":age,"fresh":age is not None and 0<=age<interval+5_000}
+                if len(bars) < 21:
+                    raise ValueError(f"insufficient_candles:{name}")
+                if not 0 <= age < interval + 5_000:
+                    raise ValueError(f"stale_candles:{name}")
                 if any(b.t-a.t != interval for a,b in zip(bars, bars[1:])):
-                    raise ValueError("Non-contiguous candles")
-            found = signal(*frames, mode=engine.cfg.mode)
+                    raise ValueError(f"candle_gap:{name}")
+            checks = {}
+            found = signal(*frames, mode=engine.cfg.mode, diagnostics=checks)
+            detail.update(reason=checks["reason"],checks=checks)
             if found:
+                stats["signals"] += 1
                 price = api.quote(symbol, engine.cfg, api.now())
                 # Store the last closed minute; next closed candle includes the fill moment.
                 if engine.enter(symbol, *found, price, frames[-1][-1].t, item["step"], item["minimum"]):
+                    stats["entries"] += 1
+                    detail["reason"] = "entry_opened"
                     store.save(engine)
                     break
+                detail["reason"] = "entry_rejected_by_risk_cooldown_or_size"
         except ValueError as exc:
-            log.info("Skipped %s: %s", symbol, exc)
+            detail["reason"] = str(exc)
+        except Exception as exc:
+            detail.update(reason="data_error",error=str(exc))
+            raise
+        finally:
+            reason = detail.get("reason","unknown")
+            stats["reasons"][reason] = stats["reasons"].get(reason,0)+1
+            emit("symbol_scan",**detail)
 
 
 def run(api, engine, store, kill_file, once=False):

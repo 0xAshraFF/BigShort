@@ -53,20 +53,29 @@ class Binance:
         return [Bar(int(r[6])+1, *map(float, r[1:6])) for r in rows if int(r[6])+1 <= now]
 
     def universe(self, cfg, now):
+        self.universe_stats = {"total":0,"contract_rejected":0,"age_rejected":0,
+                               "volume_rejected":0,"eligible":0}
         tickers = {r["symbol"]: r for r in self.get("ticker/24hr")}
         result = []
         for s in self.get("exchangeInfo")["symbols"]:
+            self.universe_stats["total"] += 1
             age = (now - s.get("onboardDate", 0)) / 86_400_000
             if not (s["status"] == "TRADING" and s["contractType"] == "PERPETUAL"
-                    and s["quoteAsset"] == "USDT" and 4 <= age <= cfg.max_age_days):
+                    and s["quoteAsset"] == "USDT"):
+                self.universe_stats["contract_rejected"] += 1
+                continue
+            if not 4 <= age <= cfg.max_age_days:
+                self.universe_stats["age_rejected"] += 1
                 continue
             if float(tickers.get(s["symbol"], {}).get("quoteVolume", 0)) < cfg.min_quote_volume:
+                self.universe_stats["volume_rejected"] += 1
                 continue
             filters = {x["filterType"]: x for x in s["filters"]}
             lot = filters.get("MARKET_LOT_SIZE", filters["LOT_SIZE"])
             result.append({"symbol": s["symbol"], "age_days": age,
                            "step": float(lot["stepSize"]),
                            "minimum": float(filters.get("MIN_NOTIONAL", {}).get("notional", 5))})
+        self.universe_stats["eligible"] = len(result)
         return sorted(result, key=lambda r: r["age_days"])
 
     def quote(self, symbol, cfg, now):
