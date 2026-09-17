@@ -106,4 +106,24 @@ The available Binance ChatGPT plugin supplies **public read-only market data**, 
 
 An AI may review reports and propose versioned experiments; it should not move stops, raise leverage or rewrite a running account's rules. No paid AI subscription/API is needed. No subscription-income target is imposed.
 
+## Model hunter experiment
+
+The optional `hunter` service runs three isolated OpenRouter paper accounts alongside the unchanged
+deterministic incumbent. Each challenger receives the same public Binance market snapshot and has
+its own cash, positions, P&L, journal, and API-cost ledger. Challengers see only a delayed peer
+scorecard; they do not see pending decisions, have no trade quota, and cannot increase the fixed
+risk envelope. Model output may request a short or an early exit, while local stops, sizing, circuit
+breakers, leverage limits, and time exits remain authoritative.
+
+The configured candidates are Ling 3.0 Flash Fin (free), DeepSeek V4 Flash 0731 (mid), and Claude
+Opus 5 (frontier). Local paid-model allocations total $9.50 ($2.00 mid, $7.50 frontier), leaving a
+small buffer below the requested $10 ceiling. Configure an OpenRouter server-side guardrail as the
+authoritative spending cap. The service reads the key from the read-only Desktop file mounted in
+`compose.yaml`; it never copies the credential into the repository or logs it.
+
+```bash
+docker compose up -d --build hunter
+docker compose logs -f --tail 100 hunter
+```
+
 API reference: [Binance futures market data](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data). Access depends on network and regional availability; do not bypass restrictions.
