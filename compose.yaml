@@ -29,6 +29,22 @@ services:
       options:
         max-size: '10m'
         max-file: '3'
+  hunter2:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "bigshort.hunter_round2"]
+    volumes:
+      - hunter-data:/hunter
+      - '/Users/ash/Desktop/10 temp.rtf:/run/secrets/openrouter.rtf:ro'
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
 volumes:
   paper-data:
   hunter-data:

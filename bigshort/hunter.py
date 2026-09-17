@@ -36,6 +36,8 @@ class Candidate:
     prompt_price: float
     completion_price: float
     max_tokens: int = 500
+    round_key: str = "round_start_ms"
+    instructions: str = ""
 
 
 CANDIDATES = (
@@ -138,7 +140,7 @@ class HunterLedger:
             raise ValueError('Invalid cost reservation')
         self.db.execute('BEGIN IMMEDIATE')
         try:
-            start=self.metadata('round_start_ms')
+            start=self.metadata(candidate.round_key)
             if start is not None and int(time.time()*1000)>=start+ROUND_MS:
                 raise RuntimeError('Tournament deadline reached')
             if self.metadata('billing_halted'):
@@ -292,8 +294,9 @@ class OpenRouter:
             catalog=json.load(response)['data']
         model=next((m for m in catalog if m['id']==candidate.model),None)
         if model is None: raise ValueError('Configured model unavailable; no fallback')
+        system_prompt=SYSTEM_PROMPT + ("\n"+candidate.instructions if candidate.instructions else "")
         body=json.dumps({
-            'model':candidate.model,'messages':[{'role':'system','content':SYSTEM_PROMPT},
+            'model':candidate.model,'messages':[{'role':'system','content':system_prompt},
                                                {'role':'user','content':prompt}],
             'temperature':.2,'max_tokens':candidate.max_tokens,
             'plugins':[{'id':'web','enabled':False}],
@@ -363,6 +366,7 @@ def features(symbol, frames, bid, ask):
     returns = [pct(m1[-i].c, m1[-i-1].c) for i in range(1, min(15, len(m1)-1))]
     return {
         "symbol": symbol, "bid": bid, "ask": ask,
+        "bar_close_4h_ms": h4[-1].t,
         "spread_bps": round((ask - bid) / bid * 10_000, 3),
         "return_4h_1_pct": pct(h4[-1].c, h4[-2].c),
         "return_4h_3_pct": pct(h4[-1].c, h4[-4].c),
@@ -377,7 +381,8 @@ def features(symbol, frames, bid, ask):
     }
 
 
-def leaderboard(stores):
+def leaderboard(stores, candidates=CANDIDATES):
+    models={c.name:c.model for c in candidates}
     board = []
     for name, store in stores.items():
         report = store.report()
@@ -387,7 +392,7 @@ def leaderboard(stores):
         detail=state.get('hunter_v2',{})
         equity=detail.get('account_equity',cash)
         board.append({
-            "candidate": name, "active_model":next(c.model for c in CANDIDATES if c.name==name),
+            "candidate": name, "active_model":models[name],
             "performance_scope":"account lifetime, including any prior model", "closed_trades": report["closed_trades"],
             "net_pnl": round(report["net_closed_pnl"], 6),
             "win_rate": report["win_rate"], "profit_factor": report["profit_factor"],
