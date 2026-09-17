@@ -118,9 +118,9 @@ scorecard; they do not see pending decisions, have no trade quota, and cannot in
 risk envelope. Model output may request a short or an early exit, while local stops, sizing, circuit
 breakers, leverage limits, and time exits remain authoritative.
 
-The configured candidates are Ling 3.0 Flash Fin (free), DeepSeek V4 Flash 0731 (mid), and Claude
-Opus 5 (frontier). Hunter v2 limits each paid candidate to $3, with Scout restricted to free calls.
-The unused free-slot budget is not transferred. A non-resetting OpenRouter key limit of at most $10
+The configured candidates are Ling 3.0 Flash Fin (free), DeepSeek V4 Flash 0731 (mid), and GLM
+5.3 (Elite, replacing Opus at the user’s request). Hunter v2 limits each paid candidate to $3, with Scout restricted to free calls.
+The unused free-slot budget is not transferred. An OpenRouter key limit of at most $10
 is verified before model calls; existing spending and uncertain charges remain counted. The service reads the key from the read-only Desktop file mounted in
 `compose.yaml`; it never copies the credential into the repository or logs it.
 

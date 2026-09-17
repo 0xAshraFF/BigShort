@@ -35,14 +35,17 @@ class Candidate:
     budget: float
     prompt_price: float
     completion_price: float
+    max_tokens: int = 500
 
 
 CANDIDATES = (
     Candidate("scout", "free", "inclusionai/ling-3.0-flash-fin:free", 0.0, 0.0, 0.0),
     Candidate("analyst", "mid", "deepseek/deepseek-v4-flash-0731", 3.0, 0.00000006, 0.00000012),
-    Candidate("elite", "frontier", "anthropic/claude-opus-5", 3.0, 0.000005, 0.000025),
+    Candidate("elite", "frontier", "z-ai/glm-5.3", 3.0, 0.0000014, 0.0000044, 2048),
 )
 
+
+LEGACY_OPUS = Candidate("elite", "frontier", "anthropic/claude-opus-5", 3.0, .000005, .000025)
 
 def emit(kind, **values):
     print(json.dumps({"kind": kind, "timestamp": datetime.now(timezone.utc).isoformat(), **values}), flush=True)
@@ -91,7 +94,7 @@ class HunterLedger:
             self.db.execute('BEGIN IMMEDIATE')
             try:
                 for name,model,prompt in self.db.execute("SELECT candidate,model,prompt FROM calls WHERE cost=0 AND status='error' AND model NOT LIKE '%:free'").fetchall():
-                    candidate=next((c for c in CANDIDATES if c.name==name and c.model==model),None)
+                    candidate=next((c for c in (*CANDIDATES,LEGACY_OPUS) if c.name==name and c.model==model),None)
                     if candidate is None:
                         self.db.execute("INSERT OR REPLACE INTO metadata VALUES('billing_halted','true')")
                         continue
@@ -130,7 +133,7 @@ class HunterLedger:
             query+=' AND candidate=?';args=(candidate,)
         return self.spent(candidate)+float(self.db.execute(query,args).fetchone()[0])
 
-    def reserve(self,candidate,amount):
+    def reserve(self,candidate,amount,key_available=None):
         if not math.isfinite(amount) or amount<0:
             raise ValueError('Invalid cost reservation')
         self.db.execute('BEGIN IMMEDIATE')
@@ -140,6 +143,10 @@ class HunterLedger:
                 raise RuntimeError('Tournament deadline reached')
             if self.metadata('billing_halted'):
                 raise RuntimeError('Billing reconciliation required')
+            if key_available is not None:
+                pending=self.committed()-self.spent()
+                if amount+pending>key_available:
+                    raise RuntimeError('Key credit headroom exhausted, including pending/uncertain requests')
             if self.committed()+amount>TOTAL_BUDGET_USD or self.committed(candidate.name)+amount>candidate.budget:
                 raise RuntimeError('API budget exhausted (includes uncertain billing)')
             cur=self.db.execute("INSERT INTO reservations(candidate,amount,status) VALUES(?,?,'pending')",
@@ -187,11 +194,68 @@ class HunterLedger:
                 f"INSERT INTO calls({','.join(keys)}) VALUES({','.join('?' for _ in keys)})",
                 tuple(row.get(k) for k in keys))
 
-    def recent_decisions(self, candidate, limit=5):
-        rows = self.db.execute(
-            "SELECT decision FROM calls WHERE candidate=? AND status='ok' ORDER BY id DESC LIMIT ?",
-            (candidate, limit)).fetchall()
+    def recent_decisions(self, candidate, limit=5, model=None):
+        query="SELECT decision FROM calls WHERE candidate=? AND status='ok'"
+        args=[candidate]
+        if model:
+            query+=' AND model=?';args.append(model)
+        rows=self.db.execute(query+' ORDER BY id DESC LIMIT ?',args+[limit]).fetchall()
         return [json.loads(r[0]) for r in rows if r[0]]
+
+
+def validate_key_metadata(data, now=None):
+    """Expiration is not a credit reset. Local durable budgets never reset either way."""
+    now=time.time() if now is None else now
+    limit=data.get('limit')
+    if limit is None or not math.isfinite(float(limit)) or not 0<float(limit)<=10:
+        raise RuntimeError('OpenRouter key credit limit must be at most $10; reported limit='+str(limit))
+    expires=data.get('expires_at')
+    if expires:
+        try:
+            expiry=datetime.fromisoformat(str(expires).replace('Z','+00:00'))
+            if expiry.tzinfo is None: raise ValueError('Missing timezone')
+        except ValueError:
+            raise RuntimeError('Unrecognized key expiration timestamp') from None
+        if expiry.timestamp()<=now: raise RuntimeError('OpenRouter key has expired')
+    usage=data.get('usage')
+    if data.get('limit_reset') is not None and usage is None:
+        raise RuntimeError('Resetting key requires lifetime usage metadata to verify the $10 ceiling')
+    usage=float(usage or 0)
+    if not math.isfinite(usage) or usage<0: raise RuntimeError('Invalid key usage metadata')
+    remaining=data.get('limit_remaining')
+    remaining=float(remaining) if remaining is not None else max(0,float(limit)-usage)
+    if not math.isfinite(remaining) or remaining<0: raise RuntimeError('Invalid remaining key credit')
+    return {'limit':float(limit),'limit_reset':data.get('limit_reset'),'expires_at':expires,
+            'lifetime_usage':usage,'available':min(remaining,max(0,10-usage))}
+
+
+def model_rates(model,candidate,prompt_bound):
+    pricing=dict(model['pricing'])
+    overrides=pricing.pop('overrides',[]) or []
+    if not isinstance(overrides,list): raise ValueError('Invalid pricing overrides')
+    applicable=[]
+    for tier in overrides:
+        if not isinstance(tier,dict): raise ValueError('Invalid pricing tier')
+        threshold=float(tier.get('min_prompt_tokens',0))
+        if not math.isfinite(threshold) or threshold<0: raise ValueError('Invalid tier threshold')
+        if prompt_bound>=threshold: applicable.append((threshold,tier))
+    # Use the most expensive reachable rate, not a possibly cheaper overwritten tier.
+    for _,tier in sorted(applicable,key=lambda x:x[0]):
+        for key,value in tier.items():
+            if key!='min_prompt_tokens':
+                pricing[key]=max(float(pricing.get(key) or 0),float(value or 0))
+    recognized={'prompt','completion','input_cache_read','input_cache_write','input_cache_write_1h'}
+    rates={}
+    for key,value in pricing.items():
+        price=float(value or 0)
+        if not math.isfinite(price) or price<0: raise ValueError('Invalid catalog price: '+key)
+        if key=='web_search': continue  # This text-only request explicitly disables web search.
+        if key not in recognized and price: raise ValueError('Unsupported active model charge: '+key)
+        rates[key]=price
+    if 'prompt' not in rates or 'completion' not in rates: raise ValueError('Missing token prices')
+    if rates['prompt']>candidate.prompt_price or rates['completion']>candidate.completion_price:
+        raise ValueError('Current token price exceeds configured ceiling')
+    return max(candidate.prompt_price,rates.get('input_cache_write',0),rates.get('input_cache_write_1h',0))
 
 
 class OpenRouter:
@@ -222,37 +286,33 @@ class OpenRouter:
             raise RuntimeError('Billing halted: reconcile provider charges before resuming')
         request=Request('https://openrouter.ai/api/v1/key',headers={'Authorization':f'Bearer {self.key}'})
         with urlopen(request,timeout=15) as response: key_data=json.load(response)['data']
-        limit=key_data.get('limit')
-        if limit is None or not 0<float(limit)<=10 or key_data.get('limit_reset') is not None:
-            raise RuntimeError('A dedicated non-resetting OpenRouter key cap of at most $10 is required')
+        key_status=validate_key_metadata(key_data)
         # Pin maximum provider prices; never assume a stale catalog price is authoritative.
         with urlopen('https://openrouter.ai/api/v1/models',timeout=15) as response:
             catalog=json.load(response)['data']
         model=next((m for m in catalog if m['id']==candidate.model),None)
         if model is None: raise ValueError('Configured model unavailable; no fallback')
-        pricing=model['pricing']
-        for k,v in pricing.items():
-            price=float(v or 0)
-            if not math.isfinite(price) or price<0: raise ValueError('Invalid catalog price')
-            if k not in {'prompt','completion','input_cache_read','input_cache_write'} and price:
-                raise ValueError('Unsupported extra model charge; request blocked')
-        pp,cp=float(pricing['prompt']),float(pricing['completion'])
-        if pp>candidate.prompt_price or cp>candidate.completion_price:
-            raise ValueError('Current model price exceeds configured ceiling')
         body=json.dumps({
             'model':candidate.model,'messages':[{'role':'system','content':SYSTEM_PROMPT},
                                                {'role':'user','content':prompt}],
-            'temperature':.2,'max_tokens':500,
+            'temperature':.2,'max_tokens':candidate.max_tokens,
+            'plugins':[{'id':'web','enabled':False}],
             'provider':{'allow_fallbacks':False,'require_parameters':True,
                         'max_price':{'prompt':candidate.prompt_price*1e6,
                                      'completion':candidate.completion_price*1e6,'request':0}},
         }).encode()
+        if 'reasoning' in model.get('supported_parameters',[]):
+            request_body=json.loads(body)
+            request_body['reasoning']=({'effort':'low','exclude':False} if candidate.tier=='frontier'
+                                       else {'enabled':False})
+            body=json.dumps(request_body).encode()
         # Conservative text byte bound, including system message and framing allowance.
         bound=len(body)+2048
-        if bound+500>int(model.get('context_length',0)):
+        if bound+candidate.max_tokens>int(model.get('context_length',0)):
             raise ValueError('Prompt exceeds conservative context limit')
-        estimated=bound*max(candidate.prompt_price,float(pricing.get('input_cache_write') or 0))+500*candidate.completion_price
-        reservation=self.ledger.reserve(candidate,estimated)
+        cache_ceiling=model_rates(model,candidate,bound)
+        estimated=bound*cache_ceiling+candidate.max_tokens*candidate.completion_price
+        reservation=self.ledger.reserve(candidate,estimated,key_status['available'])
         raw=None;decision=None;usage={};error=None
         try:
             request=Request('https://openrouter.ai/api/v1/chat/completions',data=body,headers={
@@ -327,7 +387,8 @@ def leaderboard(stores):
         detail=state.get('hunter_v2',{})
         equity=detail.get('account_equity',cash)
         board.append({
-            "candidate": name, "closed_trades": report["closed_trades"],
+            "candidate": name, "active_model":next(c.model for c in CANDIDATES if c.name==name),
+            "performance_scope":"account lifetime, including any prior model", "closed_trades": report["closed_trades"],
             "net_pnl": round(report["net_closed_pnl"], 6),
             "win_rate": report["win_rate"], "profit_factor": report["profit_factor"],
             "equity":equity,"open_position":state.get('position') is not None,
@@ -452,6 +513,32 @@ def execute_decision(api,engine,decision,snapshot,decision_started,expected_trad
     return action,ok
 
 
+def sync_candidate_models(ledger):
+    signature=[{'name':c.name,'model':c.model} for c in CANDIDATES]
+    old=ledger.metadata('candidate_models')
+    if old is None:
+        old=[]
+        for c in CANDIDATES:
+            row=ledger.db.execute('SELECT model FROM calls WHERE candidate=? ORDER BY id DESC LIMIT 1',(c.name,)).fetchone()
+            old.append({'name':c.name,'model':row[0] if row else c.model})
+    previous={x['name']:x['model'] for x in old}
+    if set(previous)!={x['name'] for x in signature}: raise ValueError('Unexpected candidate roster change')
+    changes=[]
+    for current in signature:
+        before=previous[current['name']]
+        if before==current['model']: continue
+        if (current['name'],before,current['model'])!=('elite','anthropic/claude-opus-5','z-ai/glm-5.3'):
+            raise ValueError('Unapproved model change within experiment')
+        changes.append({'candidate':'elite','from':before,'to':current['model'],
+                        't':int(time.time()*1000),'reason':'user_requested_replacement'})
+    history=ledger.metadata('model_transitions') or []
+    with ledger.db:
+        ledger.db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('candidate_models',json.dumps(signature)))
+        ledger.db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('model_transitions',json.dumps(history+changes)))
+    for change in changes: emit('hunter_model_changed',**change)
+    return signature
+
+
 def run(key_path,root='/hunter',once=False):
     Path(root).mkdir(parents=True,exist_ok=True)
     with open(f'{root}/hunter.lock','a') as lock:
@@ -468,15 +555,12 @@ def _run_locked(key_path,root,once):
     engines={name:HunterEngine(cfg,store.load(),[json.loads(row[0]) for row in store.db.execute('SELECT payload FROM events ORDER BY id')])
              for name,store in stores.items()}
     started=ledger.round_start(int(time.time()*1000));deadline_ms=started+ROUND_MS
-    signature=[{'name':c.name,'model':c.model} for c in CANDIDATES]
-    old=ledger.metadata('candidate_models')
-    if old is not None and old!=signature:
-        raise ValueError('Models changed within an existing experiment')
-    ledger.metadata('candidate_models',signature)
+    signature=sync_candidate_models(ledger)
     # Persist migrated state before any possible crash or model call.
     for name in engines: stores[name].save(engines[name])
     emit('hunter_started',execution_version=2,round_start_ms=started,deadline_ms=deadline_ms,
-         spent=ledger.spent(),committed=ledger.committed(),no_automatic_promotion=True)
+         spent=ledger.spent(),committed=ledger.committed(),no_automatic_promotion=True,models=signature,
+         model_transitions=ledger.metadata('model_transitions'))
     pool=ThreadPoolExecutor(max_workers=3)
     pending={}
     try:
@@ -495,7 +579,7 @@ def _run_locked(key_path,root,once):
                     decision,cost=future.result()
                     if not healthy[name]: raise ValueError('Management or funding unhealthy; signal rejected')
                     action,executed=execute_decision(api,e,decision,snapshot,submitted,expected,deadline_ms)
-                    e.event('model_decision',t=int(time.time()*1000),candidate=name,action=action,
+                    e.event('model_decision',t=int(time.time()*1000),candidate=name,model=next(c.model for c in CANDIDATES if c.name==name),action=action,
                             executed=executed,cost=cost,thesis=decision.get('thesis'))
                     emit('hunter_decision',candidate=name,action=action,executed=executed,
                          spent=ledger.spent(name),committed=ledger.committed(name))
@@ -516,7 +600,7 @@ def _run_locked(key_path,root,once):
                     for c in CANDIDATES:
                         e=engines[c.name]
                         if not snapshot or not healthy[c.name] or e.halted or captured>=deadline_ms: continue
-                        prompt=prompt_for(e,snapshot,board,ledger.recent_decisions(c.name),captured)
+                        prompt=prompt_for(e,snapshot,board,ledger.recent_decisions(c.name,model=c.model),captured)
                         pending[c.name]=(pool.submit(client.decide,c,prompt,captured),snapshot,captured,e.trade_id)
                 except Exception as exc:
                     emit('hunter_cycle_error',error=str(exc))
@@ -529,13 +613,50 @@ def _run_locked(key_path,root,once):
         pool.shutdown(wait=False,cancel_futures=True)
 
 
+def check_access(key_path,root):
+    key=load_key(key_path)
+    request=Request('https://openrouter.ai/api/v1/key',headers={'Authorization':f'Bearer {key}'})
+    with urlopen(request,timeout=15) as response: data=json.load(response)['data']
+    try:
+        status=validate_key_metadata(data)
+        emit('hunter_access_key',ok=True,**status)
+    except Exception as exc:
+        emit('hunter_access_key',ok=False,error=str(exc),limit=data.get('limit'),
+             limit_reset=data.get('limit_reset'),expires_at=data.get('expires_at'))
+    with urlopen('https://openrouter.ai/api/v1/models',timeout=15) as response: models=json.load(response)['data']
+    for candidate in CANDIDATES:
+        model=next((m for m in models if m['id']==candidate.model),None)
+        try:
+            if model is None: raise ValueError('Configured model unavailable')
+            ceiling=model_rates(model,candidate,16000)
+            emit('hunter_access_model',candidate=candidate.name,model=candidate.model,ok=True,
+                 check_prompt_bound=16000,cache_write_ceiling=ceiling)
+        except Exception as exc:
+            emit('hunter_access_model',candidate=candidate.name,model=candidate.model,ok=False,error=str(exc))
+    path=Path(root)/'hunter.sqlite'
+    if path.exists():
+        db=sqlite3.connect('file:'+str(path)+'?mode=ro',uri=True)
+        try:
+            row=db.execute("SELECT value FROM metadata WHERE key='round_start_ms'").fetchone()
+            start=json.loads(row[0]) if row else db.execute('SELECT MIN(t) FROM calls').fetchone()[0]
+            halt=db.execute("SELECT value FROM metadata WHERE key='billing_halted'").fetchone()
+            emit('hunter_access_round',deadline_ms=start+ROUND_MS if start is not None else None,
+                 expired=start is not None and int(time.time()*1000)>=start+ROUND_MS,
+                 billing_halted=json.loads(halt[0]) if halt else False)
+        finally: db.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Independent OpenRouter paper-trader hunter")
     parser.add_argument("--key-file", default="/run/secrets/openrouter.rtf")
     parser.add_argument("--root", default="/hunter")
     parser.add_argument("--once", action="store_true")
+    parser.add_argument('--check-access',action='store_true',help='Read-only key/model diagnostics; no completions or trading')
     args = parser.parse_args()
-    run(args.key_file, args.root, args.once)
+    if args.check_access:
+        check_access(args.key_file,args.root)
+    else:
+        run(args.key_file, args.root, args.once)
 
 
 if __name__ == "__main__":
