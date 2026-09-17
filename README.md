@@ -108,6 +108,9 @@ An AI may review reports and propose versioned experiments; it should not move s
 
 ## Model hunter experiment
 
+See [Hunter v2 fixes and upgrade instructions](docs/HUNTER_FIXES.md) for persistent budgets,
+24-hour expiry, fresh-quote execution and account migration. The incumbent is unchanged.
+
 The optional `hunter` service runs three isolated OpenRouter paper accounts alongside the unchanged
 deterministic incumbent. Each challenger receives the same public Binance market snapshot and has
 its own cash, positions, P&L, journal, and API-cost ledger. Challengers see only a delayed peer
@@ -116,13 +119,13 @@ risk envelope. Model output may request a short or an early exit, while local st
 breakers, leverage limits, and time exits remain authoritative.
 
 The configured candidates are Ling 3.0 Flash Fin (free), DeepSeek V4 Flash 0731 (mid), and Claude
-Opus 5 (frontier). Local paid-model allocations total $9.50 ($2.00 mid, $7.50 frontier), leaving a
-small buffer below the requested $10 ceiling. Configure an OpenRouter server-side guardrail as the
-authoritative spending cap. The service reads the key from the read-only Desktop file mounted in
+Opus 5 (frontier). Hunter v2 limits each paid candidate to $3, with Scout restricted to free calls.
+The unused free-slot budget is not transferred. A non-resetting OpenRouter key limit of at most $10
+is verified before model calls; existing spending and uncertain charges remain counted. The service reads the key from the read-only Desktop file mounted in
 `compose.yaml`; it never copies the credential into the repository or logs it.
 
 ```bash
-docker compose up -d --build hunter
+docker compose up -d --no-deps --build hunter
 docker compose logs -f --tail 100 hunter
 ```
 

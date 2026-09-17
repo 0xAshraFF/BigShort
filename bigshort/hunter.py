@@ -4,6 +4,10 @@ import json
 import re
 import sqlite3
 import time
+import fcntl
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,12 +16,13 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .core import Config, Engine, upper
-from .market import Binance
-from .runner import manage
-from .store import Store
+from .hunter_market import HunterMarket, fresh_quote
+from .hunter_execution import HunterEngine, HunterStore
 
 
-TOTAL_BUDGET_USD = 9.50
+TOTAL_BUDGET_USD = 9.0
+ROUND_MS = 24 * 60 * 60 * 1000
+DECISION_TTL_MS = 180_000
 DECISION_INTERVAL_SECONDS = 30 * 60
 LOOP_SECONDS = 15
 
@@ -34,8 +39,8 @@ class Candidate:
 
 CANDIDATES = (
     Candidate("scout", "free", "inclusionai/ling-3.0-flash-fin:free", 0.0, 0.0, 0.0),
-    Candidate("analyst", "mid", "deepseek/deepseek-v4-flash-0731", 2.0, 0.00000006, 0.00000012),
-    Candidate("elite", "frontier", "anthropic/claude-opus-5", 7.50, 0.000005, 0.000025),
+    Candidate("analyst", "mid", "deepseek/deepseek-v4-flash-0731", 3.0, 0.00000006, 0.00000012),
+    Candidate("elite", "frontier", "anthropic/claude-opus-5", 3.0, 0.000005, 0.000025),
 )
 
 
@@ -54,7 +59,8 @@ def load_key(path):
 class HunterLedger:
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
+        self.path = path
+        self.local = threading.local()
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS calls(
@@ -62,6 +68,10 @@ class HunterLedger:
           model TEXT NOT NULL, prompt TEXT NOT NULL, response TEXT, decision TEXT,
           prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,
           cost REAL DEFAULT 0, status TEXT NOT NULL, error TEXT);
+        CREATE TABLE IF NOT EXISTS reservations(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, candidate TEXT NOT NULL,
+          amount REAL NOT NULL, actual REAL, status TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS snapshots(
           id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER NOT NULL, payload TEXT NOT NULL);
         """)
@@ -74,6 +84,89 @@ class HunterLedger:
                         self.db.execute("UPDATE calls SET cost=? WHERE id=?", (cost, row_id))
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
+
+        # Reserve conservatively for legacy errors that recorded no known provider charge.
+        # The migration is atomic and never resets either spend or the experiment clock.
+        if self.metadata('billing_migration_v2') is None:
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                for name,model,prompt in self.db.execute("SELECT candidate,model,prompt FROM calls WHERE cost=0 AND status='error' AND model NOT LIKE '%:free'").fetchall():
+                    candidate=next((c for c in CANDIDATES if c.name==name and c.model==model),None)
+                    if candidate is None:
+                        self.db.execute("INSERT OR REPLACE INTO metadata VALUES('billing_halted','true')")
+                        continue
+                    amount=(len((prompt or '').encode())+len(SYSTEM_PROMPT.encode())+4096)*candidate.prompt_price*2+500*candidate.completion_price
+                    self.db.execute("INSERT INTO reservations(candidate,amount,status) VALUES(?,?,'unknown')",(name,amount))
+                self.db.execute("INSERT INTO metadata VALUES('billing_migration_v2','true')")
+                self.db.commit()
+            except Exception:
+                self.db.rollback();raise
+
+    @property
+    def db(self):
+        if not hasattr(self.local, 'connection'):
+            self.local.connection=sqlite3.connect(self.path,timeout=20)
+        return self.local.connection
+
+    def metadata(self,key,value=None):
+        if value is not None:
+            with self.db:
+                self.db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',(key,json.dumps(value)))
+        row=self.db.execute('SELECT value FROM metadata WHERE key=?',(key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def round_start(self,now):
+        start=self.metadata('round_start_ms')
+        if start is None:
+            row=self.db.execute('SELECT MIN(t) FROM calls').fetchone()[0]
+            start=int(row) if row is not None else now
+            self.metadata('round_start_ms',start)
+        return start
+
+    def committed(self,candidate=None):
+        query="SELECT COALESCE(SUM(amount),0) FROM reservations WHERE status IN ('pending','unknown')"
+        args=()
+        if candidate:
+            query+=' AND candidate=?';args=(candidate,)
+        return self.spent(candidate)+float(self.db.execute(query,args).fetchone()[0])
+
+    def reserve(self,candidate,amount):
+        if not math.isfinite(amount) or amount<0:
+            raise ValueError('Invalid cost reservation')
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            start=self.metadata('round_start_ms')
+            if start is not None and int(time.time()*1000)>=start+ROUND_MS:
+                raise RuntimeError('Tournament deadline reached')
+            if self.metadata('billing_halted'):
+                raise RuntimeError('Billing reconciliation required')
+            if self.committed()+amount>TOTAL_BUDGET_USD or self.committed(candidate.name)+amount>candidate.budget:
+                raise RuntimeError('API budget exhausted (includes uncertain billing)')
+            cur=self.db.execute("INSERT INTO reservations(candidate,amount,status) VALUES(?,?,'pending')",
+                                (candidate.name,amount))
+            self.db.commit();return cur.lastrowid
+        except Exception:
+            self.db.rollback();raise
+
+    def settle(self,reservation,row,actual):
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            record=self.db.execute('SELECT amount,status FROM reservations WHERE id=?',(reservation,)).fetchone()
+            if record is None or record[1]!='pending': raise ValueError('Reservation already settled or missing')
+            held=record[0]
+            if actual is None:
+                status='unknown';row['cost']=0
+            else:
+                if not math.isfinite(actual) or actual<0: raise ValueError('Invalid billed cost')
+                status='settled';row['cost']=actual
+                if actual>held+1e-9:
+                    self.db.execute("INSERT OR REPLACE INTO metadata VALUES('billing_halted','true')")
+            self.db.execute('UPDATE reservations SET status=?,actual=? WHERE id=?',(status,actual,reservation))
+            keys=list(row)
+            self.db.execute(f"INSERT INTO calls({','.join(keys)}) VALUES({','.join('?' for _ in keys)})",tuple(row.values()))
+            self.db.commit()
+        except Exception:
+            self.db.rollback();raise
 
     def spent(self, candidate=None):
         if candidate:
@@ -125,61 +218,66 @@ class OpenRouter:
         return result
 
     def decide(self, candidate, prompt, now):
-        estimated = len(prompt) / 4 * candidate.prompt_price + 500 * candidate.completion_price
-        if self.ledger.spent() + estimated > TOTAL_BUDGET_USD:
-            raise RuntimeError("Total OpenRouter budget exhausted")
-        if candidate.budget and self.ledger.spent(candidate.name) + estimated > candidate.budget:
-            raise RuntimeError(f"{candidate.name} budget exhausted")
-        body = json.dumps({
-            "model": candidate.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 500,
-            "reasoning": {"effort": "low" if candidate.tier == "frontier" else "none",
-                          "exclude": False},
+        if self.ledger.metadata('billing_halted'):
+            raise RuntimeError('Billing halted: reconcile provider charges before resuming')
+        request=Request('https://openrouter.ai/api/v1/key',headers={'Authorization':f'Bearer {self.key}'})
+        with urlopen(request,timeout=15) as response: key_data=json.load(response)['data']
+        limit=key_data.get('limit')
+        if limit is None or not 0<float(limit)<=10 or key_data.get('limit_reset') is not None:
+            raise RuntimeError('A dedicated non-resetting OpenRouter key cap of at most $10 is required')
+        # Pin maximum provider prices; never assume a stale catalog price is authoritative.
+        with urlopen('https://openrouter.ai/api/v1/models',timeout=15) as response:
+            catalog=json.load(response)['data']
+        model=next((m for m in catalog if m['id']==candidate.model),None)
+        if model is None: raise ValueError('Configured model unavailable; no fallback')
+        pricing=model['pricing']
+        for k,v in pricing.items():
+            price=float(v or 0)
+            if not math.isfinite(price) or price<0: raise ValueError('Invalid catalog price')
+            if k not in {'prompt','completion','input_cache_read','input_cache_write'} and price:
+                raise ValueError('Unsupported extra model charge; request blocked')
+        pp,cp=float(pricing['prompt']),float(pricing['completion'])
+        if pp>candidate.prompt_price or cp>candidate.completion_price:
+            raise ValueError('Current model price exceeds configured ceiling')
+        body=json.dumps({
+            'model':candidate.model,'messages':[{'role':'system','content':SYSTEM_PROMPT},
+                                               {'role':'user','content':prompt}],
+            'temperature':.2,'max_tokens':500,
+            'provider':{'allow_fallbacks':False,'require_parameters':True,
+                        'max_price':{'prompt':candidate.prompt_price*1e6,
+                                     'completion':candidate.completion_price*1e6,'request':0}},
         }).encode()
-        raw = None
+        # Conservative text byte bound, including system message and framing allowance.
+        bound=len(body)+2048
+        if bound+500>int(model.get('context_length',0)):
+            raise ValueError('Prompt exceeds conservative context limit')
+        estimated=bound*max(candidate.prompt_price,float(pricing.get('input_cache_write') or 0))+500*candidate.completion_price
+        reservation=self.ledger.reserve(candidate,estimated)
+        raw=None;decision=None;usage={};error=None
         try:
-            request = Request("https://openrouter.ai/api/v1/chat/completions", data=body, headers={
-                "Authorization": f"Bearer {self.key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/0xAshraFF/BigShort",
-                "X-Title": "BigShort Paper Hunter",
-            })
-            with urlopen(request, timeout=45) as response:
-                raw = response.read().decode()
-            payload = json.loads(raw)
-            content = payload["choices"][0]["message"]["content"]
-            decision = self._parse(content)
-            usage = payload.get("usage", {})
-            cost = float(usage.get("cost") or (
-                usage.get("prompt_tokens", 0) * candidate.prompt_price
-                + usage.get("completion_tokens", 0) * candidate.completion_price))
-            self.ledger.save_call(
-                t=now, candidate=candidate.name, model=candidate.model, prompt=prompt,
-                response=raw, decision=json.dumps(decision, sort_keys=True),
-                prompt_tokens=int(usage.get("prompt_tokens", 0)),
-                completion_tokens=int(usage.get("completion_tokens", 0)), cost=cost,
-                status="ok", error=None)
-            return decision, cost
+            request=Request('https://openrouter.ai/api/v1/chat/completions',data=body,headers={
+                'Authorization':f'Bearer {self.key}','Content-Type':'application/json',
+                'HTTP-Referer':'https://github.com/0xAshraFF/BigShort','X-Title':'BigShort Paper Hunter'})
+            with urlopen(request,timeout=45) as response: raw=response.read().decode()
+            payload=json.loads(raw);usage=payload.get('usage',{})
+            decision=self._parse(payload['choices'][0]['message']['content'])
         except Exception as exc:
-            detail = f"HTTP {exc.code}" if isinstance(exc, HTTPError) else str(exc)
-            try:
-                usage = json.loads(raw).get("usage", {}) if raw else {}
-            except (TypeError, ValueError, json.JSONDecodeError):
-                usage = {}
-            cost = float(usage.get("cost") or (
-                usage.get("prompt_tokens", 0) * candidate.prompt_price
-                + usage.get("completion_tokens", 0) * candidate.completion_price))
-            self.ledger.save_call(
-                t=now, candidate=candidate.name, model=candidate.model, prompt=prompt,
-                response=raw, decision=None, prompt_tokens=int(usage.get("prompt_tokens", 0)),
-                completion_tokens=int(usage.get("completion_tokens", 0)),
-                cost=cost, status="error", error=detail)
-            raise
+            error=f'HTTP {exc.code}' if isinstance(exc,HTTPError) else type(exc).__name__
+        actual=usage.get('cost')
+        try:
+            actual=float(actual) if actual is not None else None
+            if actual is not None and (not math.isfinite(actual) or actual<0): actual=None
+        except (ValueError,TypeError): actual=None
+        if candidate.tier=='free' and estimated==0 and actual is None: actual=0.0
+        row=dict(t=now,candidate=candidate.name,model=candidate.model,prompt=prompt,response=raw,
+                 decision=json.dumps(decision,sort_keys=True) if decision else None,
+                 prompt_tokens=int(usage.get('prompt_tokens',0)),completion_tokens=int(usage.get('completion_tokens',0)),
+                 cost=0,status='error' if error else 'ok',error=error)
+        self.ledger.settle(reservation,row,actual)
+        if error: raise RuntimeError('OpenRouter request failed: '+error)
+        if actual is None or self.ledger.metadata('billing_halted'):
+            raise RuntimeError('Uncertain billing; reserved cost retained and signal rejected')
+        return decision,actual
 
 
 SYSTEM_PROMPT = """You run one independent SHORT-ONLY cryptocurrency paper account.
@@ -226,26 +324,39 @@ def leaderboard(stores):
         state = report["state"] or {}
         cash = state.get("cash", 100.0)
         peak = state.get("peak", 100.0)
+        detail=state.get('hunter_v2',{})
+        equity=detail.get('account_equity',cash)
         board.append({
             "candidate": name, "closed_trades": report["closed_trades"],
             "net_pnl": round(report["net_closed_pnl"], 6),
             "win_rate": report["win_rate"], "profit_factor": report["profit_factor"],
-            "drawdown_pct": round((cash / peak - 1) * 100, 4) if peak else 0,
+            "equity":equity,"open_position":state.get('position') is not None,
+            "last_observed_ms":detail.get('last_observed'),
+            "funding_pending_closed_trades":report.get('funding_pending_closed_trades',0),
+            "drawdown_pct":round(max(0,1-equity/peak)*100,4) if peak else 0,
+            "max_drawdown_pct_since_v2":detail.get('max_drawdown_pct'),
         })
     return board
 
 
 def build_snapshot(api, cfg, now):
-    result = []
-    for item in api.universe(cfg, now):
-        symbol = item["symbol"]
-        frames = [api.bars(symbol, interval, now) for interval in ("4h", "15m", "1m")]
-        if any(len(frame) < 21 for frame in frames):
-            continue
-        quote = api.get("ticker/bookTicker", symbol=symbol)
-        bid, ask = float(quote["bidPrice"]), float(quote["askPrice"])
-        if 0 < bid <= ask and (ask-bid)/bid*10_000 <= cfg.max_spread_bps:
-            result.append({"market": features(symbol, frames, bid, ask), "item": item})
+    result=[]
+    for item in api.universe(cfg,now):
+        symbol=item['symbol']
+        try:
+            fetched=api.now()
+            frames=[api.bars(symbol,interval,fetched) for interval in ('4h','15m','1m')]
+            bid,ask,checked=fresh_quote(api,symbol,cfg,entry=True)
+            for frame,span in zip(frames,[14400000,900000,60000]):
+                if len(frame)<21 or not 0<=checked-frame[-1].t<span+5000:
+                    raise ValueError('Insufficient or stale candles')
+                if any(b.t-a.t!=span for a,b in zip(frame,frame[1:])):
+                    raise ValueError('Non-contiguous candles')
+            market=features(symbol,frames,bid,ask)
+            market['observed_at_ms']=checked
+            result.append({'market':market,'item':item})
+        except ValueError as exc:
+            emit('hunter_symbol_skipped',symbol=symbol,reason=str(exc))
     return result
 
 
@@ -285,60 +396,137 @@ def validate_decision(decision, engine, snapshot):
     return action
 
 
-def run(key_path, root="/hunter", once=False):
-    cfg = Config()
-    api = Binance()
-    ledger = HunterLedger(f"{root}/hunter.sqlite")
-    client = OpenRouter(load_key(key_path), ledger)
-    stores = {c.name: Store(f"{root}/{c.name}.sqlite", cfg) for c in CANDIDATES}
-    engines = {name: Engine(cfg, store.load()) for name, store in stores.items()}
-    next_decision = 0
-    while True:
+def manage_hunter(api,engine,store,stop=False,expired=False):
+    if stop or expired:
+        engine.halted=True
+        store.save(engine)  # Local halt is durable before any network dependency.
+    error=False
+    if engine.position:
         try:
-            now = api.now()
-            for name in engines:
-                manage(api, engines[name], stores[name], now)
-            if now >= next_decision:
-                snapshot = build_snapshot(api, cfg, now)
-                ledger.save_snapshot(now, [x["market"] for x in snapshot])
-                board = leaderboard(stores)
-                for candidate in CANDIDATES:
-                    engine, store = engines[candidate.name], stores[candidate.name]
-                    prompt = prompt_for(engine, snapshot, board,
-                                        ledger.recent_decisions(candidate.name), now)
-                    try:
-                        decision, cost = client.decide(candidate, prompt, now)
-                        action = validate_decision(decision, engine, snapshot)
-                        executed = False
-                        if action == "EXIT" and engine.position:
-                            quote = api.get("ticker/bookTicker", symbol=engine.position.symbol)
-                            engine.close(float(quote["askPrice"]), now, "model_exit")
-                            executed = True
-                        elif action == "SHORT" and not engine.position:
-                            selected = next(x for x in snapshot if x["market"]["symbol"] == decision["symbol"])
-                            market = selected["market"]
-                            stop = market["ask"] * (1 + float(decision["stop_pct"]) / 100)
-                            executed = engine.enter(decision["symbol"], f"model:{candidate.name}", stop,
-                                                    market["bid"], now//60_000*60_000,
-                                                    selected["item"]["step"], selected["item"]["minimum"])
-                        engine.event("model_decision", t=now, candidate=candidate.name,
-                                     model=candidate.model, action=action, executed=executed,
-                                     confidence=decision.get("confidence"), thesis=decision.get("thesis"), cost=cost)
-                        store.save(engine)
-                        emit("hunter_decision", candidate=candidate.name, model=candidate.model,
-                             action=action, executed=executed, decision=decision,
-                             spent=ledger.spent(candidate.name))
-                    except Exception as exc:
-                        engine.event("model_error", t=now, candidate=candidate.name, error=str(exc))
-                        store.save(engine)
-                        emit("hunter_error", candidate=candidate.name, error=str(exc))
-                emit("hunter_leaderboard", board=leaderboard(stores), total_spent=ledger.spent())
-                next_decision = (now // (DECISION_INTERVAL_SECONDS * 1000) + 1) * DECISION_INTERVAL_SECONDS * 1000
+            _,ask,observed=fresh_quote(api,engine.position.symbol,engine.cfg)
+            if stop or expired:
+                engine.close(ask,observed,'kill_switch' if stop else 'tournament_deadline')
+            else:
+                engine.observe(ask,observed)
         except Exception as exc:
-            emit("hunter_cycle_error", error=str(exc))
-        if once:
-            return
-        time.sleep(LOOP_SECONDS)
+            error=True
+            engine.event('management_error',error=str(exc))
+        finally:
+            store.save(engine)
+    # Funding never blocks protective observation above, even for closed positions.
+    if engine.settlements:
+        try:
+            engine.reconcile_funding(api,api.now())
+        except Exception as exc:
+            error=True
+            engine.event('funding_pending',error=str(exc))
+        finally:
+            store.save(engine)
+    return not error
+
+
+def execute_decision(api,engine,decision,snapshot,decision_started,expected_trade,deadline_ms):
+    now=api.now()
+    if engine.halted or now>=deadline_ms or now-decision_started>DECISION_TTL_MS:
+        raise ValueError('Decision expired or account halted')
+    if engine.trade_id!=expected_trade:
+        raise ValueError('Position changed while model was reasoning')
+    action=validate_decision(decision,engine,snapshot)
+    if action=='HOLD': return action,False
+    bid,ask,filled=fresh_quote(api,decision['symbol'],engine.cfg,entry=action=='SHORT')
+    if filled>=deadline_ms or filled-decision_started>DECISION_TTL_MS:
+        raise ValueError('Decision expired while retrieving quote')
+    if action=='EXIT':
+        engine.close(ask,filled,'model_exit');return action,True
+    selected=next(x for x in snapshot if x['market']['symbol']==decision['symbol'])
+    market=selected['market']
+    if filled-market['observed_at_ms']>DECISION_TTL_MS:
+        raise ValueError('Selected market snapshot expired')
+    if abs(bid/market['bid']-1)>.005:
+        raise ValueError('Price moved more than 0.5% since model snapshot')
+    stop=market['ask']*(1+float(decision['stop_pct'])/100)
+    if not .003<=stop/bid-1<=.05:
+        raise ValueError('Original stop no longer valid at executable quote')
+    ok=engine.enter(decision['symbol'],'model',stop,bid,filled,
+                    selected['item']['step'],selected['item']['minimum'])
+    return action,ok
+
+
+def run(key_path,root='/hunter',once=False):
+    Path(root).mkdir(parents=True,exist_ok=True)
+    with open(f'{root}/hunter.lock','a') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise RuntimeError('Another hunter owns this experiment') from None
+        _run_locked(key_path,root,once)
+
+
+def _run_locked(key_path,root,once):
+    cfg=Config();api=HunterMarket(root)
+    ledger=HunterLedger(f'{root}/hunter.sqlite')
+    client=OpenRouter(load_key(key_path),ledger)
+    stores={c.name:HunterStore(f'{root}/{c.name}.sqlite',cfg) for c in CANDIDATES}
+    engines={name:HunterEngine(cfg,store.load(),[json.loads(row[0]) for row in store.db.execute('SELECT payload FROM events ORDER BY id')])
+             for name,store in stores.items()}
+    started=ledger.round_start(int(time.time()*1000));deadline_ms=started+ROUND_MS
+    signature=[{'name':c.name,'model':c.model} for c in CANDIDATES]
+    old=ledger.metadata('candidate_models')
+    if old is not None and old!=signature:
+        raise ValueError('Models changed within an existing experiment')
+    ledger.metadata('candidate_models',signature)
+    # Persist migrated state before any possible crash or model call.
+    for name in engines: stores[name].save(engines[name])
+    emit('hunter_started',execution_version=2,round_start_ms=started,deadline_ms=deadline_ms,
+         spent=ledger.spent(),committed=ledger.committed(),no_automatic_promotion=True)
+    pool=ThreadPoolExecutor(max_workers=3)
+    pending={}
+    try:
+        while True:
+            now=int(time.time()*1000)
+            stop=Path(f'{root}/STOP').exists()
+            expired=now>=deadline_ms
+            healthy={}
+            for name,e in engines.items():
+                healthy[name]=manage_hunter(api,e,stores[name],stop,expired)
+            for name,job in list(pending.items()):
+                future,snapshot,submitted,expected=job
+                if not future.done(): continue
+                e,store=engines[name],stores[name]
+                try:
+                    decision,cost=future.result()
+                    if not healthy[name]: raise ValueError('Management or funding unhealthy; signal rejected')
+                    action,executed=execute_decision(api,e,decision,snapshot,submitted,expected,deadline_ms)
+                    e.event('model_decision',t=int(time.time()*1000),candidate=name,action=action,
+                            executed=executed,cost=cost,thesis=decision.get('thesis'))
+                    emit('hunter_decision',candidate=name,action=action,executed=executed,
+                         spent=ledger.spent(name),committed=ledger.committed(name))
+                except Exception as exc:
+                    e.event('model_error',error=str(exc))
+                    emit('hunter_error',candidate=name,error=str(exc))
+                finally:
+                    store.save(e);del pending[name]
+            next_decision=ledger.metadata('next_decision_ms') or 0
+            if not stop and not expired and not pending and now>=next_decision:
+                # Reserve the round BEFORE I/O, so restarts never cause an immediate retry storm.
+                ledger.metadata('next_decision_ms',now+DECISION_INTERVAL_SECONDS*1000)
+                try:
+                    snapshot=build_snapshot(api,cfg,api.now())
+                    captured=int(time.time()*1000)
+                    ledger.save_snapshot(captured,[x['market'] for x in snapshot])
+                    board=leaderboard(stores)
+                    for c in CANDIDATES:
+                        e=engines[c.name]
+                        if not snapshot or not healthy[c.name] or e.halted or captured>=deadline_ms: continue
+                        prompt=prompt_for(e,snapshot,board,ledger.recent_decisions(c.name),captured)
+                        pending[c.name]=(pool.submit(client.decide,c,prompt,captured),snapshot,captured,e.trade_id)
+                except Exception as exc:
+                    emit('hunter_cycle_error',error=str(exc))
+            emit('hunter_leaderboard',board=leaderboard(stores),total_spent=ledger.spent(),
+                 committed=ledger.committed(),deadline_ms=deadline_ms,expired=expired,
+                 pending_models=list(pending),execution_version=2)
+            if once: return
+            time.sleep(LOOP_SECONDS)
+    finally:
+        pool.shutdown(wait=False,cancel_futures=True)
 
 
 def main():
